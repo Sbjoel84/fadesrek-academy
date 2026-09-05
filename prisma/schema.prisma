@@ -1,0 +1,2639 @@
+// ============================================================================
+// Fadesrek Academy — School Management System
+// PostgreSQL schema (Prisma) — the data layer behind the RBAC catalogue and
+// every module the front end already implements against an in-memory store.
+// ============================================================================
+//
+// Conventions
+// -----------
+// • Primary keys        id String @id @default(uuid()) @db.Uuid — a UUID per
+//   row, not a serial int, so a record created offline or merged in from
+//   another environment never collides with one already in the table.
+//
+// • Soft deletes        deletedAt DateTime? — a row is never physically
+//   removed by the application. Every query that means "still alive" filters
+//   deletedAt IS NULL (Prisma middleware / a repository base class is the
+//   right place to enforce that consistently — not shown here, since it's
+//   application code, not schema).
+//
+// • Status               status RecordStatus @default(ACTIVE) — the generic
+//   lifecycle flag (active / inactive / archived), independent of any
+//   domain-specific workflow state a model also carries — e.g. Application
+//   has both its own `stage` (the admissions pipeline) and this generic
+//   `status` (is the row itself live).
+//
+// • Optimistic locking / versioning   version Int @default(1) — the service
+//   layer increments this on every update and includes it in the WHERE
+//   clause: UPDATE ... SET version = version + 1 WHERE id = $1 AND version =
+//   $2. A zero-row result means someone else wrote first. Prisma has no
+//   built-in optimistic-concurrency middleware, so enforcement lives in the
+//   service layer — this column is what makes that enforceable, and doubles
+//   as the row's revision number.
+//
+// • Audit trail          createdAt/updatedAt/deletedAt record *when*;
+//   createdById/updatedById/deletedById record *who*, in one of two ways:
+//     - Primary business records — the ~30 tables below where "who touched
+//       this" carries real operational or compliance weight (people, money,
+//       approvals, submissions, uploads) — carry a real foreign key to
+//       User, enforced at the database level, with a matching back-relation
+//       on User.
+//     - Reference and catalogue tables (the academic calendar, the
+//       class/subject list, salary grades, the fee schedule, CBT content,
+//       the RBAC catalogue itself) still carry the three *_by columns,
+//       indexed, but as plain UUID columns rather than enforced relations.
+//       Modelling all ~55 tables as full relations to User would give User
+//       three back-reference arrays per table — 150+ fields on one model —
+//       for tables whose edit history is rarely queried by "who". The
+//       column survives either way; only the enforced-relation ceremony is
+//       scoped to where it earns its keep.
+//
+// • Junction / line-item tables (RolePermission, ClassSubject,
+//   StudentGuardian, CbtQuestionOption, AttendanceRecord, InvoiceLine,
+//   TransportStop, GalleryImage) intentionally skip the full audit block.
+//   A line item's lifecycle is owned by its parent — nobody soft-deletes one
+//   invoice line independently of the invoice it belongs to — so these
+//   carry only createdAt and the foreign keys that make them a link.
+//
+// • AuditLog and Session are append-only / ephemeral by design and are
+//   exempt from the standard block for the same reason a ledger doesn't
+//   edit its own past entries: mutating an audit log defeats its purpose.
+//
+// • Money is stored in kobo (1/100 of a naira) as Int, never as a float —
+//   the same rule the application layer already follows.
+//
+// • Table and multi-word column names are mapped to snake_case (@@map /
+//   @map); Prisma models and fields stay PascalCase/camelCase.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Supabase's transaction pooler (DATABASE_URL, port 6543) doesn't support
+  // the session-level features (advisory locks, prepared statements)
+  // Prisma Migrate needs — directUrl points migrations at the session-mode
+  // pooler instead. App runtime queries always use DATABASE_URL.
+  directUrl = env("DIRECT_URL")
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum RecordStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+enum Gender {
+  MALE
+  FEMALE
+}
+
+enum RoleScope {
+  GLOBAL
+  CLASS
+  OWN_RECORDS
+  SELF
+}
+
+enum ApplicationStage {
+  SUBMITTED
+  PAYMENT_CONFIRMED
+  UNDER_REVIEW
+  SHORTLISTED
+  EXAM_TAKEN
+  INTERVIEWED
+  OFFERED
+  ENROLLED
+  REJECTED
+}
+
+enum LessonPlanStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+}
+
+enum DayOfWeek {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+}
+
+enum AttendanceMark {
+  PRESENT
+  ABSENT
+  LATE
+}
+
+enum PaymentMethod {
+  BANK_TRANSFER
+  PAYSTACK
+  FLUTTERWAVE
+  CASH
+}
+
+enum FeeAppliesTo {
+  ALL
+  BOARDER
+  TRANSPORT
+}
+
+enum LeaveType {
+  ANNUAL
+  CASUAL
+  SICK
+  MATERNITY
+  STUDY
+  COMPASSIONATE
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  DECLINED
+}
+
+enum PayrollRunStatus {
+  AWAITING_APPROVAL
+  APPROVED
+  PAID
+}
+
+enum StockMovementKind {
+  RECEIPT
+  ISSUE
+}
+
+enum CbtCandidateKind {
+  STUDENT
+  APPLICANT
+}
+
+enum CbtAttemptStatus {
+  IN_PROGRESS
+  SUBMITTED
+  GRADED
+}
+
+enum PostStatus {
+  DRAFT
+  PUBLISHED
+}
+
+enum NoticeColor {
+  YELLOW
+  LILAC
+  PEACH
+}
+
+/// A student's position in their own lifecycle at the school — separate from
+/// the generic RecordStatus every table carries, the same way Application
+/// keeps `stage` apart from `status`.
+enum StudentLifecycleStatus {
+  ENROLLED
+  GRADUATED
+  TRANSFERRED
+  WITHDRAWN
+}
+
+enum BloodGroup {
+  A_POS
+  A_NEG
+  B_POS
+  B_NEG
+  AB_POS
+  AB_NEG
+  O_POS
+  O_NEG
+}
+
+enum Genotype {
+  AA
+  AS
+  SS
+  AC
+}
+
+enum BehaviourCategory {
+  MERIT
+  DEMERIT
+}
+
+enum BehaviourSeverity {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum PromotionOutcome {
+  PROMOTED
+  REPEATED
+  CONDITIONAL
+}
+
+enum TransferDirection {
+  INCOMING
+  OUTGOING
+}
+
+enum TransferStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+}
+
+enum WithdrawalReason {
+  RELOCATION
+  FINANCIAL
+  ACADEMIC
+  DISCIPLINARY
+  MEDICAL
+  OTHER
+}
+
+enum CertificateType {
+  TRANSFER
+  GRADUATION
+  TESTIMONIAL
+  RESULT
+  BIRTH_ATTESTATION
+}
+
+enum DocumentCategory {
+  BIRTH_CERTIFICATE
+  PASSPORT_PHOTO
+  IMMUNISATION_RECORD
+  PREVIOUS_RESULT
+  INDIGENE_CERTIFICATE
+  MEDICAL_REPORT
+  OTHER
+}
+
+enum BiometricType {
+  FINGERPRINT
+  FACE
+  IRIS
+}
+
+enum TimelineCategory {
+  ENROLLMENT
+  ACADEMIC
+  ATTENDANCE
+  BEHAVIOUR
+  MEDICAL
+  LIFECYCLE
+  DOCUMENT
+}
+
+// ============================================================================
+// IDENTITY & ACCESS — Role, Permission, User, Session, AuditLog, Notification
+// ============================================================================
+
+model Role {
+  id    String    @id @default(uuid()) @db.Uuid
+  key   String    @unique @db.VarChar(40) // e.g. PRINCIPAL, CLASS_TEACHER
+  title String    @db.VarChar(80)
+  scope RoleScope @default(GLOBAL)
+
+  permissions   RolePermission[]
+  users         User[]
+  notifications Notification[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("roles")
+}
+
+model Permission {
+  id     String @id @default(uuid()) @db.Uuid
+  module String @db.VarChar(40)
+  action String @db.VarChar(20)
+  key    String @unique @db.VarChar(64) // "module.action" — denormalised for fast lookup, kept in sync with (module, action) by the app layer
+
+  roles RolePermission[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([module, action])
+  @@index([module])
+  @@map("permissions")
+}
+
+/// Junction table: which permissions a role holds. No audit block — a grant
+/// either exists or it doesn't; its history belongs in AuditLog, not in a
+/// soft-deleted row sitting in the join table.
+model RolePermission {
+  id           String     @id @default(uuid()) @db.Uuid
+  roleId       String     @map("role_id") @db.Uuid
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permissionId String     @map("permission_id") @db.Uuid
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+/// The login identity. Deliberately separate from Staff/Student/Guardian —
+/// not everyone with a person record can sign in, and the shape of "who can
+/// log in" (username, password, role) has nothing to do with the shape of
+/// "who this person is" (name, DOB, class). At most one of staffId /
+/// studentId / guardianId is set, matching the role's scope.
+model User {
+  id           String @id @default(uuid()) @db.Uuid
+  username     String @unique @db.VarChar(120)
+  passwordHash String @map("password_hash") @db.VarChar(255)
+  displayName  String @map("display_name") @db.VarChar(120)
+
+  roleId String @map("role_id") @db.Uuid
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  staffId    String?   @unique @map("staff_id") @db.Uuid
+  staff      Staff?    @relation(fields: [staffId], references: [id], onDelete: SetNull)
+  studentId  String?   @unique @map("student_id") @db.Uuid
+  student    Student?  @relation(fields: [studentId], references: [id], onDelete: SetNull)
+  guardianId String?   @unique @map("guardian_id") @db.Uuid
+  guardian   Guardian? @relation(fields: [guardianId], references: [id], onDelete: SetNull)
+
+  /// Set only for a CLASS-scoped role (e.g. Class Teacher) — which class
+  /// this particular login is homeroom teacher for. A role is reusable
+  /// across many people; the class assignment is per person, so it lives
+  /// here rather than on Role.
+  homeroomClassId String?      @map("homeroom_class_id") @db.Uuid
+  homeroomClass   SchoolClass? @relation("ClassHomeroomTeacher", fields: [homeroomClassId], references: [id], onDelete: SetNull)
+
+  sessions        Session[]
+  auditEntries    AuditLog[]
+  aiConversations AiConversation[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("UserCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("UserUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("UserDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  usersCreated User[] @relation("UserCreatedBy")
+  usersUpdated User[] @relation("UserUpdatedBy")
+  usersDeleted User[] @relation("UserDeletedBy")
+
+  // --- back-references: who created / updated / deleted each record ------
+  // One array per (model, action) pair. Verbose by nature of the pattern
+  // described at the top of this file — grouped in the same order as the
+  // rest of the schema so a given block is easy to find.
+  createdStaffs                Staff[]                @relation("StaffCreatedBy")
+  updatedStaffs                Staff[]                @relation("StaffUpdatedBy")
+  deletedStaffs                Staff[]                @relation("StaffDeletedBy")
+  createdGuardians             Guardian[]             @relation("GuardianCreatedBy")
+  updatedGuardians             Guardian[]             @relation("GuardianUpdatedBy")
+  deletedGuardians             Guardian[]             @relation("GuardianDeletedBy")
+  createdStudents              Student[]              @relation("StudentCreatedBy")
+  updatedStudents              Student[]              @relation("StudentUpdatedBy")
+  deletedStudents              Student[]              @relation("StudentDeletedBy")
+  createdStudentEnrollments    StudentEnrollment[]    @relation("StudentEnrollmentCreatedBy")
+  updatedStudentEnrollments    StudentEnrollment[]    @relation("StudentEnrollmentUpdatedBy")
+  deletedStudentEnrollments    StudentEnrollment[]    @relation("StudentEnrollmentDeletedBy")
+  createdApplications          Application[]          @relation("ApplicationCreatedBy")
+  updatedApplications          Application[]          @relation("ApplicationUpdatedBy")
+  deletedApplications          Application[]          @relation("ApplicationDeletedBy")
+  createdLessonPlans           LessonPlan[]           @relation("LessonPlanCreatedBy")
+  updatedLessonPlans           LessonPlan[]           @relation("LessonPlanUpdatedBy")
+  deletedLessonPlans           LessonPlan[]           @relation("LessonPlanDeletedBy")
+  createdAssignments           Assignment[]           @relation("AssignmentCreatedBy")
+  updatedAssignments           Assignment[]           @relation("AssignmentUpdatedBy")
+  deletedAssignments           Assignment[]           @relation("AssignmentDeletedBy")
+  createdAssignmentSubmissions AssignmentSubmission[] @relation("AssignmentSubmissionCreatedBy")
+  updatedAssignmentSubmissions AssignmentSubmission[] @relation("AssignmentSubmissionUpdatedBy")
+  deletedAssignmentSubmissions AssignmentSubmission[] @relation("AssignmentSubmissionDeletedBy")
+  createdScores                Score[]                @relation("ScoreCreatedBy")
+  updatedScores                Score[]                @relation("ScoreUpdatedBy")
+  deletedScores                Score[]                @relation("ScoreDeletedBy")
+  createdCbtAttempts           CbtAttempt[]           @relation("CbtAttemptCreatedBy")
+  updatedCbtAttempts           CbtAttempt[]           @relation("CbtAttemptUpdatedBy")
+  deletedCbtAttempts           CbtAttempt[]           @relation("CbtAttemptDeletedBy")
+  createdAttendanceRegisters   AttendanceRegister[]   @relation("AttendanceRegisterCreatedBy")
+  updatedAttendanceRegisters   AttendanceRegister[]   @relation("AttendanceRegisterUpdatedBy")
+  deletedAttendanceRegisters   AttendanceRegister[]   @relation("AttendanceRegisterDeletedBy")
+  createdInvoices              Invoice[]              @relation("InvoiceCreatedBy")
+  updatedInvoices              Invoice[]              @relation("InvoiceUpdatedBy")
+  deletedInvoices              Invoice[]              @relation("InvoiceDeletedBy")
+  createdPayments              Payment[]              @relation("PaymentCreatedBy")
+  updatedPayments              Payment[]              @relation("PaymentUpdatedBy")
+  deletedPayments              Payment[]              @relation("PaymentDeletedBy")
+  createdLedgerEntries         LedgerEntry[]          @relation("LedgerEntryCreatedBy")
+  updatedLedgerEntries         LedgerEntry[]          @relation("LedgerEntryUpdatedBy")
+  deletedLedgerEntries         LedgerEntry[]          @relation("LedgerEntryDeletedBy")
+  createdScholarships          Scholarship[]          @relation("ScholarshipCreatedBy")
+  updatedScholarships          Scholarship[]          @relation("ScholarshipUpdatedBy")
+  deletedScholarships          Scholarship[]          @relation("ScholarshipDeletedBy")
+  createdPayrollRuns           PayrollRun[]           @relation("PayrollRunCreatedBy")
+  updatedPayrollRuns           PayrollRun[]           @relation("PayrollRunUpdatedBy")
+  deletedPayrollRuns           PayrollRun[]           @relation("PayrollRunDeletedBy")
+  createdPayslips              Payslip[]              @relation("PayslipCreatedBy")
+  updatedPayslips              Payslip[]              @relation("PayslipUpdatedBy")
+  deletedPayslips              Payslip[]              @relation("PayslipDeletedBy")
+  createdLeaveRequests         LeaveRequest[]         @relation("LeaveRequestCreatedBy")
+  updatedLeaveRequests         LeaveRequest[]         @relation("LeaveRequestUpdatedBy")
+  deletedLeaveRequests         LeaveRequest[]         @relation("LeaveRequestDeletedBy")
+  createdBookLoans             BookLoan[]             @relation("BookLoanCreatedBy")
+  updatedBookLoans             BookLoan[]             @relation("BookLoanUpdatedBy")
+  deletedBookLoans             BookLoan[]             @relation("BookLoanDeletedBy")
+  createdTransportAllocations  TransportAllocation[]  @relation("TransportAllocationCreatedBy")
+  updatedTransportAllocations  TransportAllocation[]  @relation("TransportAllocationUpdatedBy")
+  deletedTransportAllocations  TransportAllocation[]  @relation("TransportAllocationDeletedBy")
+  createdHostelAllocations     HostelAllocation[]     @relation("HostelAllocationCreatedBy")
+  updatedHostelAllocations     HostelAllocation[]     @relation("HostelAllocationUpdatedBy")
+  deletedHostelAllocations     HostelAllocation[]     @relation("HostelAllocationDeletedBy")
+  createdStockMovements        StockMovement[]        @relation("StockMovementCreatedBy")
+  updatedStockMovements        StockMovement[]        @relation("StockMovementUpdatedBy")
+  deletedStockMovements        StockMovement[]        @relation("StockMovementDeletedBy")
+  createdNotices               Notice[]               @relation("NoticeCreatedBy")
+  updatedNotices               Notice[]               @relation("NoticeUpdatedBy")
+  deletedNotices               Notice[]               @relation("NoticeDeletedBy")
+  createdMessageThreads        MessageThread[]        @relation("MessageThreadCreatedBy")
+  updatedMessageThreads        MessageThread[]        @relation("MessageThreadUpdatedBy")
+  deletedMessageThreads        MessageThread[]        @relation("MessageThreadDeletedBy")
+  sentMessages                 Message[]
+  createdRemarks                Remark[]               @relation("RemarkCreatedBy")
+  updatedRemarks                Remark[]               @relation("RemarkUpdatedBy")
+  deletedRemarks                Remark[]               @relation("RemarkDeletedBy")
+  createdPages                 Page[]                 @relation("PageCreatedBy")
+  updatedPages                 Page[]                 @relation("PageUpdatedBy")
+  deletedPages                 Page[]                 @relation("PageDeletedBy")
+  createdPosts                 Post[]                 @relation("PostCreatedBy")
+  updatedPosts                 Post[]                 @relation("PostUpdatedBy")
+  deletedPosts                 Post[]                 @relation("PostDeletedBy")
+  createdEvents                Event[]                @relation("EventCreatedBy")
+  updatedEvents                Event[]                @relation("EventUpdatedBy")
+  deletedEvents                Event[]                @relation("EventDeletedBy")
+  createdGalleryAlbums         GalleryAlbum[]         @relation("GalleryAlbumCreatedBy")
+  updatedGalleryAlbums         GalleryAlbum[]         @relation("GalleryAlbumUpdatedBy")
+  deletedGalleryAlbums         GalleryAlbum[]         @relation("GalleryAlbumDeletedBy")
+  createdEnquiries             Enquiry[]              @relation("EnquiryCreatedBy")
+  updatedEnquiries             Enquiry[]              @relation("EnquiryUpdatedBy")
+  deletedEnquiries             Enquiry[]              @relation("EnquiryDeletedBy")
+  createdFileAssets            FileAsset[]            @relation("FileAssetCreatedBy")
+  updatedFileAssets            FileAsset[]            @relation("FileAssetUpdatedBy")
+  deletedFileAssets            FileAsset[]            @relation("FileAssetDeletedBy")
+  createdNotifications         Notification[]         @relation("NotificationCreatedBy")
+  updatedNotifications         Notification[]         @relation("NotificationUpdatedBy")
+  deletedNotifications         Notification[]         @relation("NotificationDeletedBy")
+
+  // --- Student Information System audit trail -----------------------------
+  createdStudentMedicalProfiles StudentMedicalProfile[] @relation("StudentMedicalProfileCreatedBy")
+  updatedStudentMedicalProfiles StudentMedicalProfile[] @relation("StudentMedicalProfileUpdatedBy")
+  deletedStudentMedicalProfiles StudentMedicalProfile[] @relation("StudentMedicalProfileDeletedBy")
+  createdMedicalVisits          MedicalVisit[]          @relation("MedicalVisitCreatedBy")
+  updatedMedicalVisits          MedicalVisit[]          @relation("MedicalVisitUpdatedBy")
+  deletedMedicalVisits          MedicalVisit[]          @relation("MedicalVisitDeletedBy")
+  createdBehaviourIncidents     BehaviourIncident[]     @relation("BehaviourIncidentCreatedBy")
+  updatedBehaviourIncidents     BehaviourIncident[]     @relation("BehaviourIncidentUpdatedBy")
+  deletedBehaviourIncidents     BehaviourIncident[]     @relation("BehaviourIncidentDeletedBy")
+  createdPromotionDecisions     PromotionDecision[]     @relation("PromotionDecisionCreatedBy")
+  updatedPromotionDecisions     PromotionDecision[]     @relation("PromotionDecisionUpdatedBy")
+  deletedPromotionDecisions     PromotionDecision[]     @relation("PromotionDecisionDeletedBy")
+  createdGraduationRecords      GraduationRecord[]      @relation("GraduationRecordCreatedBy")
+  updatedGraduationRecords      GraduationRecord[]      @relation("GraduationRecordUpdatedBy")
+  deletedGraduationRecords      GraduationRecord[]      @relation("GraduationRecordDeletedBy")
+  createdTransferRecords        TransferRecord[]        @relation("TransferRecordCreatedBy")
+  updatedTransferRecords        TransferRecord[]        @relation("TransferRecordUpdatedBy")
+  deletedTransferRecords        TransferRecord[]        @relation("TransferRecordDeletedBy")
+  createdWithdrawalRecords      WithdrawalRecord[]      @relation("WithdrawalRecordCreatedBy")
+  updatedWithdrawalRecords      WithdrawalRecord[]      @relation("WithdrawalRecordUpdatedBy")
+  deletedWithdrawalRecords      WithdrawalRecord[]      @relation("WithdrawalRecordDeletedBy")
+  createdCertificates           Certificate[]           @relation("CertificateCreatedBy")
+  updatedCertificates           Certificate[]           @relation("CertificateUpdatedBy")
+  deletedCertificates           Certificate[]           @relation("CertificateDeletedBy")
+  createdStudentDocuments       StudentDocument[]       @relation("StudentDocumentCreatedBy")
+  updatedStudentDocuments       StudentDocument[]       @relation("StudentDocumentUpdatedBy")
+  deletedStudentDocuments       StudentDocument[]       @relation("StudentDocumentDeletedBy")
+  createdBiometricRecords       BiometricRecord[]       @relation("BiometricRecordCreatedBy")
+  updatedBiometricRecords       BiometricRecord[]       @relation("BiometricRecordUpdatedBy")
+  deletedBiometricRecords       BiometricRecord[]       @relation("BiometricRecordDeletedBy")
+
+  @@index([roleId])
+  @@index([homeroomClassId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("users")
+}
+
+/// A signed-in session / refresh token. Ephemeral by nature — no soft delete,
+/// no version, no *_by columns: nobody "audits" who revoked their own
+/// session, and a session table that outlives its purpose just accretes rows
+/// forever, so a scheduled job purging expired ones is expected.
+model Session {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique @map("token_hash") @db.VarChar(255)
+  ipAddress String?   @map("ip_address") @db.VarChar(45) // fits IPv6
+  userAgent String?   @map("user_agent") @db.VarChar(255)
+  createdAt DateTime  @default(now())
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+/// Append-only. One line per state-changing action, written by the same
+/// service-layer call that performs the change — never edited, never
+/// soft-deleted (an audit log that can erase its own entries isn't one).
+/// actorName/roleKey are deliberate snapshots, not live joins: history
+/// should read the way it happened, not the way `actor` happens to be named
+/// today.
+model AuditLog {
+  id        String   @id @default(uuid()) @db.Uuid
+  actorId   String?  @map("actor_id") @db.Uuid
+  actor     User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  actorName String   @map("actor_name") @db.VarChar(120)
+  roleKey   String   @map("role_key") @db.VarChar(40)
+  action    String   @db.VarChar(64)
+  detail    String   @db.Text
+  createdAt DateTime @default(now())
+
+  @@index([actorId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_log")
+}
+
+/// Addressed to a role, not a specific user — matching the application's
+/// "one signed-in persona per role" model. roleId null means broadcast to
+/// everyone (the app's 'ALL' audience).
+model Notification {
+  id     String  @id @default(uuid()) @db.Uuid
+  roleId String? @map("role_id") @db.Uuid
+  role   Role?   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  title  String  @db.VarChar(160)
+  body   String  @db.Text
+  read   Boolean @default(false)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("NotificationCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("NotificationUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("NotificationDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([roleId])
+  @@index([read])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("notifications")
+}
+
+// ============================================================================
+// ACADEMIC STRUCTURE — session, term, class, subject, period (reference data)
+// ============================================================================
+
+model AcademicSession {
+  id   String @id @default(uuid()) @db.Uuid
+  name String @unique @db.VarChar(20) // "2026/2027"
+
+  terms             Term[]
+  enrollments       StudentEnrollment[]
+  invoices          Invoice[]
+  scores            Score[]
+  graduationRecords GraduationRecord[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@map("academic_sessions")
+}
+
+model Term {
+  id                String          @id @default(uuid()) @db.Uuid
+  academicSessionId String          @map("academic_session_id") @db.Uuid
+  academicSession   AcademicSession @relation(fields: [academicSessionId], references: [id], onDelete: Restrict)
+  name              String          @db.VarChar(20) // "First Term"
+  sequence          Int // 1, 2, 3 — for ordering without parsing the name
+  startsOn          DateTime        @map("starts_on") @db.Date
+  endsOn            DateTime        @map("ends_on") @db.Date
+  isCurrent         Boolean         @default(false) @map("is_current")
+
+  invoices Invoice[]
+  scores   Score[]
+  remarks  Remark[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([academicSessionId, sequence])
+  @@index([academicSessionId])
+  @@map("terms")
+}
+
+model SchoolClass {
+  id       String  @id @default(uuid()) @db.Uuid
+  level    String  @db.VarChar(20) // "JSS 1", "SS 2"
+  arm      String  @db.VarChar(20) // "Gold", "Science"
+  stream   String? @db.VarChar(20) // "Science" | "Arts", senior classes only
+  capacity Int
+
+  homeroomTeachers  User[]               @relation("ClassHomeroomTeacher")
+  enrollments       StudentEnrollment[]
+  subjects          ClassSubject[]
+  lessonPlans       LessonPlan[]
+  assignments       Assignment[]
+  timetableSlots    TimetableSlot[]
+  attendanceRegs    AttendanceRegister[]
+  graduationRecords GraduationRecord[]
+  materials         FileAsset[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([level, arm])
+  @@map("school_classes")
+}
+
+model Subject {
+  id       String  @id @default(uuid()) @db.Uuid
+  name     String  @db.VarChar(80)
+  code     String  @unique @db.VarChar(10)
+  isCore   Boolean @default(false) @map("is_core")
+  isJunior Boolean @default(false) @map("is_junior")
+  isSenior Boolean @default(false) @map("is_senior")
+
+  classes        ClassSubject[]
+  lessonPlans    LessonPlan[]
+  assignments    Assignment[]
+  scores         Score[]
+  timetableSlots TimetableSlot[]
+  materials      FileAsset[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@map("subjects")
+}
+
+/// Junction: which subjects are offered in which class.
+model ClassSubject {
+  id        String      @id @default(uuid()) @db.Uuid
+  classId   String      @map("class_id") @db.Uuid
+  class     SchoolClass @relation(fields: [classId], references: [id], onDelete: Cascade)
+  subjectId String      @map("subject_id") @db.Uuid
+  subject   Subject     @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([classId, subjectId])
+  @@index([subjectId])
+  @@map("class_subjects")
+}
+
+model Period {
+  id       String  @id @default(uuid()) @db.Uuid
+  label    String  @db.VarChar(20) // "1st", "Break"
+  from     String  @db.VarChar(5) // "08:00"
+  to       String  @db.VarChar(5)
+  isBreak  Boolean @default(false) @map("is_break")
+  sequence Int     @unique
+
+  timetableSlots TimetableSlot[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@map("periods")
+}
+
+// ============================================================================
+// PEOPLE — Staff, Guardian, Student, StudentEnrollment
+// ============================================================================
+
+model SalaryGrade {
+  id              String @id @default(uuid()) @db.Uuid
+  code            String @unique @db.VarChar(10) // "SMC 07"
+  name            String @db.VarChar(80) // "SMC 07 — Principal"
+  grossAnnualKobo BigInt @map("gross_annual_kobo")
+
+  staff Staff[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@map("salary_grades")
+}
+
+model Staff {
+  id         String  @id @default(uuid()) @db.Uuid
+  staffNo    String  @unique @map("staff_no") @db.VarChar(20)
+  firstName  String  @map("first_name") @db.VarChar(60)
+  lastName   String  @map("last_name") @db.VarChar(60)
+  gender     Gender
+  position   String  @db.VarChar(80)
+  department String  @db.VarChar(40)
+  trcn       String? @db.VarChar(20) // teaching licence number, teaching staff only
+  phone      String  @db.VarChar(20)
+
+  salaryGradeId  String?      @map("salary_grade_id") @db.Uuid
+  salaryGrade    SalaryGrade? @relation(fields: [salaryGradeId], references: [id], onDelete: SetNull)
+  bank           String?      @db.VarChar(60)
+  accountNo      String?      @map("account_no") @db.VarChar(10)
+  pfa            String?      @db.VarChar(80) // pension fund administrator
+  annualRentKobo BigInt       @default(0) @map("annual_rent_kobo")
+
+  user                  User?
+  lessonPlans           LessonPlan[]
+  leaveRequests         LeaveRequest[]
+  payslips              Payslip[]
+  timetableSlots        TimetableSlot[]
+  attendanceMarked      AttendanceRegister[] @relation("AttendanceMarkedByStaff")
+  bookLoansIssued       BookLoan[]           @relation("BookLoanIssuedByStaff")
+  medicalVisitsRecorded MedicalVisit[]       @relation("MedicalVisitRecordedByStaff")
+  incidentsReported     BehaviourIncident[]  @relation("BehaviourIncidentReportedByStaff")
+  documentsVerified     StudentDocument[]    @relation("StudentDocumentVerifiedByStaff")
+  messageThreads        MessageThread[]
+  remarks               Remark[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("StaffCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("StaffUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("StaffDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([salaryGradeId])
+  @@index([lastName, firstName])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("staff")
+}
+
+model Guardian {
+  id        String  @id @default(uuid()) @db.Uuid
+  firstName String  @map("first_name") @db.VarChar(60)
+  lastName  String  @map("last_name") @db.VarChar(60)
+  phone     String  @db.VarChar(20)
+  email     String? @db.VarChar(120)
+
+  user          User?
+  students      StudentGuardian[]
+  messageThreads MessageThread[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("GuardianCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("GuardianUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("GuardianDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([lastName, firstName])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("guardians")
+}
+
+/// Junction: a guardian may have several children; a child may (rarely) have
+/// several registered guardians. `isPrimary` marks who the school calls
+/// first.
+model StudentGuardian {
+  id           String   @id @default(uuid()) @db.Uuid
+  studentId    String   @map("student_id") @db.Uuid
+  student      Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  guardianId   String   @map("guardian_id") @db.Uuid
+  guardian     Guardian @relation(fields: [guardianId], references: [id], onDelete: Cascade)
+  relationship String   @db.VarChar(30) // "Father", "Mother", "Uncle" ...
+  isPrimary    Boolean  @default(true) @map("is_primary")
+
+  createdAt DateTime @default(now())
+
+  @@unique([studentId, guardianId])
+  @@index([guardianId])
+  @@map("student_guardians")
+}
+
+model Student {
+  id            String   @id @default(uuid()) @db.Uuid
+  admissionNo   String   @unique @map("admission_no") @db.VarChar(20)
+  firstName     String   @map("first_name") @db.VarChar(60)
+  lastName      String   @map("last_name") @db.VarChar(60)
+  gender        Gender
+  dob           DateTime @db.Date
+  boarder       Boolean  @default(false)
+  usesTransport Boolean  @default(false) @map("uses_transport")
+  enrolledOn    DateTime @map("enrolled_on") @db.Date
+
+  lifecycleStatus StudentLifecycleStatus @default(ENROLLED) @map("lifecycle_status")
+
+  user              User?
+  guardians         StudentGuardian[]
+  enrollments       StudentEnrollment[]
+  submissions       AssignmentSubmission[]
+  scores            Score[]
+  cbtAttempts       CbtAttempt[]
+  attendanceRecords AttendanceRecord[]
+  invoices          Invoice[]
+  payments          Payment[]
+  scholarships      Scholarship[]
+  bookLoans         BookLoan[]
+  transportAlloc    TransportAllocation?
+  hostelAlloc       HostelAllocation?
+  messageThreads    MessageThread[]
+  remarks           Remark[]
+
+  // --- Student Information System -----------------------------------------
+  medicalProfile     StudentMedicalProfile?
+  medicalVisits      MedicalVisit[]
+  behaviourIncidents BehaviourIncident[]
+  promotionDecisions PromotionDecision[]
+  graduationRecord   GraduationRecord?
+  transferRecords    TransferRecord[]
+  withdrawalRecords  WithdrawalRecord[]
+  certificates       Certificate[]
+  documents          StudentDocument[]
+  biometricRecords   BiometricRecord[]
+  timelineEvents     StudentTimelineEvent[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("StudentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("StudentUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("StudentDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([lastName, firstName])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("students")
+}
+
+/// Kept separate from Student on purpose: a student is one person across
+/// their whole time at the school; an enrollment is that person's placement
+/// in one class for one session. Promote a class to the next level and you
+/// insert a new enrollment row — you never overwrite the old one.
+model StudentEnrollment {
+  id                String          @id @default(uuid()) @db.Uuid
+  studentId         String          @map("student_id") @db.Uuid
+  student           Student         @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  classId           String          @map("class_id") @db.Uuid
+  class             SchoolClass     @relation(fields: [classId], references: [id], onDelete: Restrict)
+  academicSessionId String          @map("academic_session_id") @db.Uuid
+  academicSession   AcademicSession @relation(fields: [academicSessionId], references: [id], onDelete: Restrict)
+
+  promotionsFrom PromotionDecision[] @relation("PromotionFrom")
+  promotionsTo   PromotionDecision[] @relation("PromotionTo")
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("StudentEnrollmentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("StudentEnrollmentUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("StudentEnrollmentDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([studentId, academicSessionId])
+  @@index([classId])
+  @@index([academicSessionId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("student_enrollments")
+}
+
+// ============================================================================
+// ADMISSIONS
+// ============================================================================
+
+model Application {
+  id             String           @id @default(uuid()) @db.Uuid
+  ref            String           @unique @db.VarChar(30)
+  firstName      String           @map("first_name") @db.VarChar(60)
+  lastName       String           @map("last_name") @db.VarChar(60)
+  gender         Gender
+  dob            DateTime         @db.Date
+  applyingFor    String           @map("applying_for") @db.VarChar(20)
+  guardianName   String           @map("guardian_name") @db.VarChar(120)
+  guardianPhone  String           @map("guardian_phone") @db.VarChar(20)
+  previousSchool String?          @map("previous_school") @db.VarChar(160)
+  stage          ApplicationStage @default(SUBMITTED)
+  examScore      Int?             @map("exam_score")
+  submittedOn    DateTime         @map("submitted_on") @db.Date
+  feePaid        Boolean          @default(false) @map("fee_paid")
+
+  cbtAttempts CbtAttempt[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("ApplicationCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("ApplicationUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("ApplicationDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([stage])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("applications")
+}
+
+// ============================================================================
+// ACADEMICS — lesson plans, assignments, timetable
+// ============================================================================
+
+model LessonPlan {
+  id         String           @id @default(uuid()) @db.Uuid
+  week       Int
+  classId    String           @map("class_id") @db.Uuid
+  class      SchoolClass      @relation(fields: [classId], references: [id], onDelete: Restrict)
+  subjectId  String           @map("subject_id") @db.Uuid
+  subject    Subject          @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  staffId    String           @map("staff_id") @db.Uuid
+  staff      Staff            @relation(fields: [staffId], references: [id], onDelete: Restrict)
+  topic      String           @db.VarChar(160)
+  planStatus LessonPlanStatus @default(DRAFT) @map("plan_status")
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("LessonPlanCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("LessonPlanUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("LessonPlanDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([classId, subjectId, week])
+  @@index([staffId])
+  @@index([planStatus])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("lesson_plans")
+}
+
+model Assignment {
+  id           String      @id @default(uuid()) @db.Uuid
+  title        String      @db.VarChar(160)
+  subjectId    String      @map("subject_id") @db.Uuid
+  subject      Subject     @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  classId      String      @map("class_id") @db.Uuid
+  class        SchoolClass @relation(fields: [classId], references: [id], onDelete: Restrict)
+  instructions String      @db.Text
+  dueOn        DateTime?   @map("due_on") @db.Date
+
+  submissions AssignmentSubmission[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("AssignmentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("AssignmentUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("AssignmentDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([classId])
+  @@index([subjectId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("assignments")
+}
+
+model AssignmentSubmission {
+  id           String     @id @default(uuid()) @db.Uuid
+  assignmentId String     @map("assignment_id") @db.Uuid
+  assignment   Assignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  studentId    String     @map("student_id") @db.Uuid
+  student      Student    @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  submittedAt  DateTime   @map("submitted_at")
+  fileAssetId  String?    @map("file_asset_id") @db.Uuid
+  fileAsset    FileAsset? @relation(fields: [fileAssetId], references: [id], onDelete: SetNull)
+  grade        Int?
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("AssignmentSubmissionCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("AssignmentSubmissionUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("AssignmentSubmissionDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([assignmentId, studentId])
+  @@index([studentId])
+  @@index([fileAssetId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("assignment_submissions")
+}
+
+model TimetableSlot {
+  id        String      @id @default(uuid()) @db.Uuid
+  classId   String      @map("class_id") @db.Uuid
+  class     SchoolClass @relation(fields: [classId], references: [id], onDelete: Cascade)
+  day       DayOfWeek
+  periodId  String      @map("period_id") @db.Uuid
+  period    Period      @relation(fields: [periodId], references: [id], onDelete: Restrict)
+  subjectId String?     @map("subject_id") @db.Uuid
+  subject   Subject?    @relation(fields: [subjectId], references: [id], onDelete: SetNull)
+  staffId   String?     @map("staff_id") @db.Uuid
+  staff     Staff?      @relation(fields: [staffId], references: [id], onDelete: SetNull)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([classId, day, periodId])
+  @@index([periodId])
+  @@index([subjectId])
+  @@index([staffId])
+  @@map("timetable_slots")
+}
+
+// ============================================================================
+// EXAMINATIONS — assessment components, grading, scores, CBT
+// ============================================================================
+
+model AssessmentComponent {
+  id       String @id @default(uuid()) @db.Uuid
+  key      String @unique @db.VarChar(10) // "ca1", "exam"
+  label    String @db.VarChar(40)
+  maxScore Int    @map("max_score")
+
+  scores Score[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@map("assessment_components")
+}
+
+model GradeBand {
+  id     String @id @default(uuid()) @db.Uuid
+  minPct Int    @map("min_pct")
+  grade  String @db.VarChar(4) // "A1"
+  remark String @db.VarChar(20) // "Excellent"
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([minPct])
+  @@map("grade_bands")
+}
+
+/// One row per student × subject × component × term — never pre-summed.
+/// Re-weighting a component (Settings) or re-marking one paper recomputes
+/// every downstream total; it never triggers a migration, because no total
+/// was ever stored.
+model Score {
+  id                String              @id @default(uuid()) @db.Uuid
+  studentId         String              @map("student_id") @db.Uuid
+  student           Student             @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  subjectId         String              @map("subject_id") @db.Uuid
+  subject           Subject             @relation(fields: [subjectId], references: [id], onDelete: Restrict)
+  componentId       String              @map("component_id") @db.Uuid
+  component         AssessmentComponent @relation(fields: [componentId], references: [id], onDelete: Restrict)
+  academicSessionId String              @map("academic_session_id") @db.Uuid
+  academicSession   AcademicSession     @relation(fields: [academicSessionId], references: [id], onDelete: Restrict)
+  termId            String              @map("term_id") @db.Uuid
+  term              Term                @relation(fields: [termId], references: [id], onDelete: Restrict)
+  value             Int
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("ScoreCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("ScoreUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("ScoreDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([studentId, subjectId, componentId, termId])
+  @@index([subjectId])
+  @@index([termId])
+  @@index([academicSessionId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("scores")
+}
+
+model CbtExam {
+  id            String  @id @default(uuid()) @db.Uuid
+  subjectCode   String  @map("subject_code") @db.VarChar(10) // "MTH", or "ENTRANCE"
+  questionCount Int     @map("question_count")
+  durationMins  Int     @map("duration_mins")
+  shuffle       Boolean @default(true)
+
+  questions CbtQuestion[]
+  attempts  CbtAttempt[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@map("cbt_exams")
+}
+
+model CbtQuestion {
+  id     String  @id @default(uuid()) @db.Uuid
+  examId String  @map("exam_id") @db.Uuid
+  exam   CbtExam @relation(fields: [examId], references: [id], onDelete: Cascade)
+  stem   String  @db.Text
+
+  options CbtQuestionOption[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([examId])
+  @@map("cbt_questions")
+}
+
+/// Options normalised out of the question row (1NF) rather than kept as a
+/// four-element array — `isCorrect` on the row itself means an option can be
+/// reworded without invalidating every attempt already marked against it.
+model CbtQuestionOption {
+  id         String      @id @default(uuid()) @db.Uuid
+  questionId String      @map("question_id") @db.Uuid
+  question   CbtQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  sequence   Int
+  text       String      @db.VarChar(200)
+  isCorrect  Boolean     @default(false) @map("is_correct")
+
+  createdAt DateTime @default(now())
+
+  @@unique([questionId, sequence])
+  @@map("cbt_question_options")
+}
+
+model CbtAttempt {
+  id            String           @id @default(uuid()) @db.Uuid
+  examId        String           @map("exam_id") @db.Uuid
+  exam          CbtExam          @relation(fields: [examId], references: [id], onDelete: Restrict)
+  candidateKind CbtCandidateKind @map("candidate_kind")
+  studentId     String?          @map("student_id") @db.Uuid
+  student       Student?         @relation(fields: [studentId], references: [id], onDelete: SetNull)
+  applicationId String?          @map("application_id") @db.Uuid
+  application   Application?     @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+  questionOrder String[]         @map("question_order") @db.Uuid // frozen at start — see note below
+  startedAt     DateTime         @map("started_at")
+  deadline      DateTime
+  submittedAt   DateTime?        @map("submitted_at")
+  score         Int?
+  percent       Int?
+  attemptStatus CbtAttemptStatus @default(IN_PROGRESS) @map("attempt_status")
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("CbtAttemptCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("CbtAttemptUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("CbtAttemptDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+  // Note: questionOrder is the one deliberate exception to "no repeating
+  // groups" in this schema — it's a frozen, ordered list of question ids
+  // fixed the moment the attempt starts (Postgres native uuid[]), not a
+  // relation, because reshuffling on every render would let a candidate
+  // reload for an easier paper, and a disputed attempt has to be
+  // reconstructable exactly as it was sat.
+
+  @@index([examId])
+  @@index([studentId])
+  @@index([applicationId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("cbt_attempts")
+}
+
+// ============================================================================
+// ATTENDANCE
+// ============================================================================
+
+model AttendanceRegister {
+  id         String      @id @default(uuid()) @db.Uuid
+  classId    String      @map("class_id") @db.Uuid
+  class      SchoolClass @relation(fields: [classId], references: [id], onDelete: Restrict)
+  date       DateTime    @db.Date
+  markedById String?     @map("marked_by_staff_id") @db.Uuid
+  markedBy   Staff?      @relation("AttendanceMarkedByStaff", fields: [markedById], references: [id], onDelete: SetNull)
+  markedAt   DateTime?   @map("marked_at")
+  isDraft    Boolean     @default(true) @map("is_draft")
+
+  records AttendanceRecord[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("AttendanceRegisterCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("AttendanceRegisterUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("AttendanceRegisterDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([classId, date])
+  @@index([markedById])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("attendance_registers")
+}
+
+model AttendanceRecord {
+  id         String             @id @default(uuid()) @db.Uuid
+  registerId String             @map("register_id") @db.Uuid
+  register   AttendanceRegister @relation(fields: [registerId], references: [id], onDelete: Cascade)
+  studentId  String             @map("student_id") @db.Uuid
+  student    Student            @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  mark       AttendanceMark
+
+  createdAt DateTime @default(now())
+
+  @@unique([registerId, studentId])
+  @@index([studentId])
+  @@map("attendance_records")
+}
+
+// ============================================================================
+// FINANCE
+// ============================================================================
+
+model FeeItem {
+  id         String       @id @default(uuid()) @db.Uuid
+  name       String       @db.VarChar(80)
+  amountKobo BigInt       @map("amount_kobo")
+  appliesTo  FeeAppliesTo @default(ALL) @map("applies_to")
+
+  invoiceLines InvoiceLine[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@map("fee_items")
+}
+
+model Invoice {
+  id                String          @id @default(uuid()) @db.Uuid
+  studentId         String          @map("student_id") @db.Uuid
+  student           Student         @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  academicSessionId String          @map("academic_session_id") @db.Uuid
+  academicSession   AcademicSession @relation(fields: [academicSessionId], references: [id], onDelete: Restrict)
+  termId            String          @map("term_id") @db.Uuid
+  term              Term            @relation(fields: [termId], references: [id], onDelete: Restrict)
+  issuedOn          DateTime        @map("issued_on") @db.Date
+
+  lines    InvoiceLine[]
+  payments Payment[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("InvoiceCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("InvoiceUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("InvoiceDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([studentId, academicSessionId, termId])
+  @@index([termId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("invoices")
+}
+
+model InvoiceLine {
+  id         String  @id @default(uuid()) @db.Uuid
+  invoiceId  String  @map("invoice_id") @db.Uuid
+  invoice    Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  feeItemId  String  @map("fee_item_id") @db.Uuid
+  feeItem    FeeItem @relation(fields: [feeItemId], references: [id], onDelete: Restrict)
+  amountKobo BigInt  @map("amount_kobo") // snapshot of FeeItem.amountKobo at issue time
+
+  createdAt DateTime @default(now())
+
+  @@unique([invoiceId, feeItemId])
+  @@index([feeItemId])
+  @@map("invoice_lines")
+}
+
+model Payment {
+  id         String        @id @default(uuid()) @db.Uuid
+  studentId  String        @map("student_id") @db.Uuid
+  student    Student       @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  invoiceId  String?       @map("invoice_id") @db.Uuid
+  invoice    Invoice?      @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  amountKobo BigInt        @map("amount_kobo")
+  method     PaymentMethod
+  reference  String        @unique @db.VarChar(30)
+  gatewayRef String?       @map("gateway_ref") @db.VarChar(80)
+  paidOn     DateTime      @map("paid_on") @db.Date
+  reversed   Boolean       @default(false)
+
+  ledgerEntries LedgerEntry[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("PaymentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("PaymentUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("PaymentDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([studentId])
+  @@index([invoiceId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("payments")
+}
+
+/// Double-entry: every payment writes a balanced debit/credit pair here.
+/// Reversing a payment is a compensating entry, never an edit — the running
+/// balance is always reconstructable from this table alone.
+model LedgerEntry {
+  id            String   @id @default(uuid()) @db.Uuid
+  journalRef    String   @map("journal_ref") @db.VarChar(30)
+  paymentId     String?  @map("payment_id") @db.Uuid
+  payment       Payment? @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  debitAccount  String   @map("debit_account") @db.VarChar(40)
+  creditAccount String   @map("credit_account") @db.VarChar(40)
+  amountKobo    BigInt   @map("amount_kobo")
+  postedOn      DateTime @map("posted_on") @db.Date
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("LedgerEntryCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("LedgerEntryUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("LedgerEntryDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([journalRef])
+  @@index([paymentId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("ledger_entries")
+}
+
+model Scholarship {
+  id         String   @id @default(uuid()) @db.Uuid
+  studentId  String   @map("student_id") @db.Uuid
+  student    Student  @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  amountKobo BigInt   @map("amount_kobo")
+  reason     String   @db.VarChar(200)
+  awardedOn  DateTime @map("awarded_on") @db.Date
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("ScholarshipCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("ScholarshipUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("ScholarshipDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([studentId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("scholarships")
+}
+
+// ============================================================================
+// PAYROLL & HR
+// ============================================================================
+
+model PayrollRun {
+  id               String           @id @default(uuid()) @db.Uuid
+  month            DateTime         @db.Date // first of month, e.g. 2026-08-01
+  runStatus        PayrollRunStatus @default(AWAITING_APPROVAL) @map("run_status")
+  grossTotalKobo   BigInt           @map("gross_total_kobo")
+  payeTotalKobo    BigInt           @map("paye_total_kobo")
+  pensionTotalKobo BigInt           @map("pension_total_kobo")
+  nhfTotalKobo     BigInt           @map("nhf_total_kobo")
+  netTotalKobo     BigInt           @map("net_total_kobo")
+  staffCount       Int              @map("staff_count")
+  approvedOn       DateTime?        @map("approved_on")
+
+  payslips Payslip[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("PayrollRunCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("PayrollRunUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("PayrollRunDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([month])
+  @@index([runStatus])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("payroll_runs")
+}
+
+/// A snapshot, not a live computation — persisted at run time so a later
+/// change to a salary grade or the PAYE bands never rewrites history.
+model Payslip {
+  id                  String     @id @default(uuid()) @db.Uuid
+  payrollRunId        String     @map("payroll_run_id") @db.Uuid
+  payrollRun          PayrollRun @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+  staffId             String     @map("staff_id") @db.Uuid
+  staff               Staff      @relation(fields: [staffId], references: [id], onDelete: Restrict)
+  grossKobo           BigInt     @map("gross_kobo")
+  basicKobo           BigInt     @map("basic_kobo")
+  housingKobo         BigInt     @map("housing_kobo")
+  transportKobo       BigInt     @map("transport_kobo")
+  otherKobo           BigInt     @map("other_kobo")
+  pensionEmployeeKobo BigInt     @map("pension_employee_kobo")
+  pensionEmployerKobo BigInt     @map("pension_employer_kobo")
+  nhfKobo             BigInt     @map("nhf_kobo")
+  rentReliefKobo      BigInt     @map("rent_relief_kobo")
+  taxableKobo         BigInt     @map("taxable_kobo")
+  annualTaxKobo       BigInt     @map("annual_tax_kobo")
+  netPayKobo          BigInt     @map("net_pay_kobo")
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("PayslipCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("PayslipUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("PayslipDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([payrollRunId, staffId])
+  @@index([staffId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("payslips")
+}
+
+model LeaveRequest {
+  id          String      @id @default(uuid()) @db.Uuid
+  staffId     String      @map("staff_id") @db.Uuid
+  staff       Staff       @relation(fields: [staffId], references: [id], onDelete: Restrict)
+  leaveType   LeaveType   @map("leave_type")
+  fromDate    DateTime    @map("from_date") @db.Date
+  days        Int
+  reason      String      @db.VarChar(200)
+  leaveStatus LeaveStatus @default(PENDING) @map("leave_status")
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("LeaveRequestCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("LeaveRequestUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("LeaveRequestDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([staffId])
+  @@index([leaveStatus])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("leave_requests")
+}
+
+// ============================================================================
+// OPERATIONS — library, transport, hostel, inventory
+// ============================================================================
+
+model Book {
+  id       String @id @default(uuid()) @db.Uuid
+  title    String @db.VarChar(200)
+  author   String @db.VarChar(120)
+  category String @db.VarChar(40)
+  copies   Int
+
+  loans BookLoan[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([title])
+  @@map("books")
+}
+
+model BookLoan {
+  id         String    @id @default(uuid()) @db.Uuid
+  bookId     String    @map("book_id") @db.Uuid
+  book       Book      @relation(fields: [bookId], references: [id], onDelete: Restrict)
+  studentId  String    @map("student_id") @db.Uuid
+  student    Student   @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  issuedById String?   @map("issued_by_staff_id") @db.Uuid
+  issuedBy   Staff?    @relation("BookLoanIssuedByStaff", fields: [issuedById], references: [id], onDelete: SetNull)
+  borrowedOn DateTime  @map("borrowed_on") @db.Date
+  dueOn      DateTime  @map("due_on") @db.Date
+  returnedOn DateTime? @map("returned_on") @db.Date
+  fineKobo   BigInt    @default(0) @map("fine_kobo")
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("BookLoanCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("BookLoanUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("BookLoanDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([bookId])
+  @@index([studentId])
+  @@index([returnedOn])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("book_loans")
+}
+
+model TransportRoute {
+  id       String @id @default(uuid()) @db.Uuid
+  name     String @db.VarChar(80)
+  fareKobo BigInt @map("fare_kobo")
+
+  stops       TransportStop[]
+  allocations TransportAllocation[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@map("transport_routes")
+}
+
+model TransportStop {
+  id       String         @id @default(uuid()) @db.Uuid
+  routeId  String         @map("route_id") @db.Uuid
+  route    TransportRoute @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  sequence Int
+  name     String         @db.VarChar(80)
+
+  createdAt DateTime @default(now())
+
+  @@unique([routeId, sequence])
+  @@map("transport_stops")
+}
+
+model TransportAllocation {
+  id        String         @id @default(uuid()) @db.Uuid
+  studentId String         @unique @map("student_id") @db.Uuid
+  student   Student        @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  routeId   String         @map("route_id") @db.Uuid
+  route     TransportRoute @relation(fields: [routeId], references: [id], onDelete: Restrict)
+  stopName  String         @map("stop_name") @db.VarChar(80)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("TransportAllocationCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("TransportAllocationUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("TransportAllocationDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([routeId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("transport_allocations")
+}
+
+model Hostel {
+  id          String @id @default(uuid()) @db.Uuid
+  name        String @db.VarChar(60)
+  gender      Gender
+  rooms       Int
+  bedsPerRoom Int    @map("beds_per_room")
+
+  allocations HostelAllocation[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@map("hostels")
+}
+
+model HostelAllocation {
+  id        String  @id @default(uuid()) @db.Uuid
+  studentId String  @unique @map("student_id") @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  hostelId  String  @map("hostel_id") @db.Uuid
+  hostel    Hostel  @relation(fields: [hostelId], references: [id], onDelete: Restrict)
+  roomLabel String  @map("room_label") @db.VarChar(10)
+  bedLabel  String  @map("bed_label") @db.VarChar(10)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("HostelAllocationCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("HostelAllocationUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("HostelAllocationDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([hostelId, roomLabel, bedLabel])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("hostel_allocations")
+}
+
+model InventoryItem {
+  id           String @id @default(uuid()) @db.Uuid
+  name         String @db.VarChar(120)
+  unit         String @db.VarChar(20)
+  reorderLevel Int    @map("reorder_level")
+  unitCostKobo BigInt @map("unit_cost_kobo")
+  category     String @db.VarChar(40)
+  quantity     Int    @default(0)
+
+  movements StockMovement[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@map("inventory_items")
+}
+
+/// Append-only: a correction is a compensating movement, never an edit, so
+/// the running balance can always be reconstructed from this table and a
+/// shortfall traced to the day it appeared.
+model StockMovement {
+  id        String            @id @default(uuid()) @db.Uuid
+  itemId    String            @map("item_id") @db.Uuid
+  item      InventoryItem     @relation(fields: [itemId], references: [id], onDelete: Restrict)
+  kind      StockMovementKind
+  quantity  Int
+  reference String?           @db.VarChar(80)
+  movedOn   DateTime          @map("moved_on") @db.Date
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("StockMovementCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("StockMovementUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("StockMovementDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([itemId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("stock_movements")
+}
+
+// ============================================================================
+// COMMUNICATION
+// ============================================================================
+
+model Notice {
+  id          String      @id @default(uuid()) @db.Uuid
+  title       String      @db.VarChar(160)
+  body        String      @db.Text
+  color       NoticeColor @default(LILAC)
+  happensOn   String?     @map("happens_on") @db.VarChar(40) // free-text display date, e.g. "Saturday 15 August"
+  publishedOn DateTime    @map("published_on") @db.Date
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("NoticeCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("NoticeUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("NoticeDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([publishedOn])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("notices")
+}
+
+/// A conversation about one student, between the staff member who opened it
+/// and that student's guardian — the parent portal's "Messages from the
+/// school". A primary record, not a line item (the schema header's
+/// distinction): it has its own lifecycle worth auditing, unlike a single
+/// post within it.
+model MessageThread {
+  id         String   @id @default(uuid()) @db.Uuid
+  studentId  String   @map("student_id") @db.Uuid
+  student    Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  staffId    String   @map("staff_id") @db.Uuid
+  staff      Staff    @relation(fields: [staffId], references: [id], onDelete: Restrict)
+  guardianId String   @map("guardian_id") @db.Uuid
+  guardian   Guardian @relation(fields: [guardianId], references: [id], onDelete: Cascade)
+  subject    String   @db.VarChar(160)
+
+  messages Message[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("MessageThreadCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("MessageThreadUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("MessageThreadDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([studentId])
+  @@index([staffId])
+  @@index([guardianId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("message_threads")
+}
+
+/// One post within a thread — append-only, like AttendanceRecord: nobody
+/// edits a sent message, only reads it (`readAt`).
+model Message {
+  id       String        @id @default(uuid()) @db.Uuid
+  threadId String        @map("thread_id") @db.Uuid
+  thread   MessageThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  senderId String        @map("sender_id") @db.Uuid
+  sender   User          @relation(fields: [senderId], references: [id], onDelete: Restrict)
+  body     String        @db.Text
+  readAt   DateTime?     @map("read_at")
+
+  createdAt DateTime @default(now())
+
+  @@index([threadId])
+  @@index([senderId])
+  @@map("messages")
+}
+
+/// A teacher's end-of-term remark on a student's record — the "Class
+/// teacher's remark" line on a report card, actually authored rather than
+/// computed from the average. One per (student, staff, term): a class
+/// teacher and a principal can both leave one for the same term.
+model Remark {
+  id        String @id @default(uuid()) @db.Uuid
+  studentId String @map("student_id") @db.Uuid
+  student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  staffId   String @map("staff_id") @db.Uuid
+  staff     Staff   @relation(fields: [staffId], references: [id], onDelete: Restrict)
+  termId    String @map("term_id") @db.Uuid
+  term      Term    @relation(fields: [termId], references: [id], onDelete: Restrict)
+  body      String @db.Text
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("RemarkCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("RemarkUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("RemarkDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([studentId, staffId, termId])
+  @@index([termId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("remarks")
+}
+
+// ============================================================================
+// WEBSITE CMS
+// ============================================================================
+
+model Page {
+  id      String @id @default(uuid()) @db.Uuid
+  slug    String @unique @db.VarChar(80)
+  title   String @db.VarChar(160)
+  content String @db.Text
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("PageCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("PageUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("PageDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("pages")
+}
+
+model Post {
+  id          String     @id @default(uuid()) @db.Uuid
+  title       String     @db.VarChar(160)
+  body        String     @db.Text
+  postStatus  PostStatus @default(DRAFT) @map("post_status")
+  publishedAt DateTime?  @map("published_at")
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("PostCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("PostUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("PostDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([postStatus])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("posts")
+}
+
+model Event {
+  id        String   @id @default(uuid()) @db.Uuid
+  title     String   @db.VarChar(160)
+  eventDate DateTime @map("event_date") @db.Date
+  published Boolean  @default(false)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("EventCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("EventUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("EventDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([eventDate])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("events")
+}
+
+model GalleryAlbum {
+  id    String @id @default(uuid()) @db.Uuid
+  title String @db.VarChar(160)
+
+  images GalleryImage[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("GalleryAlbumCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("GalleryAlbumUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("GalleryAlbumDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("gallery_albums")
+}
+
+model GalleryImage {
+  id          String       @id @default(uuid()) @db.Uuid
+  albumId     String       @map("album_id") @db.Uuid
+  album       GalleryAlbum @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  fileAssetId String       @map("file_asset_id") @db.Uuid
+  fileAsset   FileAsset    @relation(fields: [fileAssetId], references: [id], onDelete: Restrict)
+  caption     String?      @db.VarChar(200)
+  sequence    Int          @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@index([albumId])
+  @@index([fileAssetId])
+  @@map("gallery_images")
+}
+
+model Enquiry {
+  id      String  @id @default(uuid()) @db.Uuid
+  name    String  @db.VarChar(120)
+  email   String? @db.VarChar(120)
+  phone   String? @db.VarChar(20)
+  message String  @db.Text
+  handled Boolean @default(false)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("EnquiryCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("EnquiryUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("EnquiryDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([handled])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("enquiries")
+}
+
+// ============================================================================
+// FILES
+// ============================================================================
+
+model FileAsset {
+  id         String @id @default(uuid()) @db.Uuid
+  name       String @db.VarChar(200)
+  category   String @db.VarChar(40)
+  storageKey String @unique @map("storage_key") @db.VarChar(255) // object-store key/URL; the app never stores the file itself in Postgres
+  sizeBytes  Int    @map("size_bytes")
+  mimeType   String @map("mime_type") @db.VarChar(100)
+
+  // Set only when category is something like 'learning_material' — a
+  // teacher's upload tagged to the class+subject it belongs to, so a
+  // student's portal can ask "materials for my class" directly. Every
+  // other FileAsset use (certificates, submissions, gallery) leaves both
+  // null; a generic file manager has no business requiring a class.
+  classId   String?      @map("class_id") @db.Uuid
+  class     SchoolClass? @relation(fields: [classId], references: [id], onDelete: SetNull)
+  subjectId String?      @map("subject_id") @db.Uuid
+  subject   Subject?     @relation(fields: [subjectId], references: [id], onDelete: SetNull)
+
+  submissions      AssignmentSubmission[]
+  galleryImages    GalleryImage[]
+  certificates     Certificate[]
+  studentDocuments StudentDocument[]
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("FileAssetCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("FileAssetUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("FileAssetDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([category])
+  @@index([classId])
+  @@index([subjectId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("file_assets")
+}
+
+// ============================================================================
+// STUDENT INFORMATION SYSTEM — the parts of a student's record that live
+// outside day-to-day academics: health, conduct, lifecycle events,
+// certification, archived paperwork, biometric enrolment, and the narrative
+// history that ties all of it together.
+// ============================================================================
+
+/// One row per student — the static health profile, not an event log.
+/// Deliberately its own table rather than columns on Student: this data has
+/// a different sensitivity class and a different access pattern (read by
+/// the nurse and by nobody else, most days) from admission number and class.
+model StudentMedicalProfile {
+  id                    String      @id @default(uuid()) @db.Uuid
+  studentId             String      @unique @map("student_id") @db.Uuid
+  student               Student     @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  bloodGroup            BloodGroup? @map("blood_group")
+  genotype              Genotype?
+  allergies             String?     @db.Text
+  conditions            String?     @db.Text
+  physicianName         String?     @map("physician_name") @db.VarChar(120)
+  physicianPhone        String?     @map("physician_phone") @db.VarChar(20)
+  emergencyContactName  String?     @map("emergency_contact_name") @db.VarChar(120)
+  emergencyContactPhone String?     @map("emergency_contact_phone") @db.VarChar(20)
+  insuranceProvider     String?     @map("insurance_provider") @db.VarChar(120)
+  insuranceNo           String?     @map("insurance_no") @db.VarChar(40)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("StudentMedicalProfileCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("StudentMedicalProfileUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("StudentMedicalProfileDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("student_medical_profiles")
+}
+
+/// Many per student — a visit to the sick bay, not the profile itself.
+model MedicalVisit {
+  id           String   @id @default(uuid()) @db.Uuid
+  studentId    String   @map("student_id") @db.Uuid
+  student      Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  visitedOn    DateTime @map("visited_on") @db.Date
+  reason       String   @db.VarChar(200)
+  treatment    String?  @db.Text
+  notes        String?  @db.Text
+  recordedById String?  @map("recorded_by_staff_id") @db.Uuid
+  recordedBy   Staff?   @relation("MedicalVisitRecordedByStaff", fields: [recordedById], references: [id], onDelete: SetNull)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("MedicalVisitCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("MedicalVisitUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("MedicalVisitDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([studentId])
+  @@index([recordedById])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("medical_visits")
+}
+
+model BehaviourIncident {
+  id           String            @id @default(uuid()) @db.Uuid
+  studentId    String            @map("student_id") @db.Uuid
+  student      Student           @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  occurredOn   DateTime          @map("occurred_on") @db.Date
+  category     BehaviourCategory
+  severity     BehaviourSeverity @default(LOW)
+  description  String            @db.Text
+  actionTaken  String?           @map("action_taken") @db.Text
+  reportedById String?           @map("reported_by_staff_id") @db.Uuid
+  reportedBy   Staff?            @relation("BehaviourIncidentReportedByStaff", fields: [reportedById], references: [id], onDelete: SetNull)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("BehaviourIncidentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("BehaviourIncidentUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("BehaviourIncidentDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([studentId])
+  @@index([category])
+  @@index([reportedById])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("behaviour_incidents")
+}
+
+/// The record of moving a student from one enrolment to the next — kept
+/// separate from StudentEnrollment itself because a promotion is a
+/// *decision* (who decided, when, on what outcome) about the boundary
+/// between two enrolments, not a property of either one.
+model PromotionDecision {
+  id               String             @id @default(uuid()) @db.Uuid
+  studentId        String             @map("student_id") @db.Uuid
+  student          Student            @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  fromEnrollmentId String             @map("from_enrollment_id") @db.Uuid
+  fromEnrollment   StudentEnrollment  @relation("PromotionFrom", fields: [fromEnrollmentId], references: [id], onDelete: Restrict)
+  toEnrollmentId   String?            @map("to_enrollment_id") @db.Uuid
+  toEnrollment     StudentEnrollment? @relation("PromotionTo", fields: [toEnrollmentId], references: [id], onDelete: SetNull)
+  outcome          PromotionOutcome
+  remarks          String?            @db.Text
+  decidedOn        DateTime           @map("decided_on") @db.Date
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("PromotionDecisionCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("PromotionDecisionUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("PromotionDecisionDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([fromEnrollmentId])
+  @@index([studentId])
+  @@index([toEnrollmentId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("promotion_decisions")
+}
+
+model GraduationRecord {
+  id                String          @id @default(uuid()) @db.Uuid
+  studentId         String          @unique @map("student_id") @db.Uuid
+  student           Student         @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  classId           String          @map("class_id") @db.Uuid
+  class             SchoolClass     @relation(fields: [classId], references: [id], onDelete: Restrict)
+  academicSessionId String          @map("academic_session_id") @db.Uuid
+  academicSession   AcademicSession @relation(fields: [academicSessionId], references: [id], onDelete: Restrict)
+  graduatedOn       DateTime        @map("graduated_on") @db.Date
+  remarks           String?         @db.Text
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("GraduationRecordCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("GraduationRecordUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("GraduationRecordDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([classId])
+  @@index([academicSessionId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("graduation_records")
+}
+
+model TransferRecord {
+  id              String            @id @default(uuid()) @db.Uuid
+  studentId       String            @map("student_id") @db.Uuid
+  student         Student           @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  direction       TransferDirection
+  otherSchoolName String            @map("other_school_name") @db.VarChar(160)
+  reason          String?           @db.Text
+  transferStatus  TransferStatus    @default(PENDING) @map("transfer_status")
+  requestedOn     DateTime          @map("requested_on") @db.Date
+  effectiveOn     DateTime?         @map("effective_on") @db.Date
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("TransferRecordCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("TransferRecordUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("TransferRecordDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([studentId])
+  @@index([transferStatus])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("transfer_records")
+}
+
+model WithdrawalRecord {
+  id          String           @id @default(uuid()) @db.Uuid
+  studentId   String           @map("student_id") @db.Uuid
+  student     Student          @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  reason      WithdrawalReason
+  detail      String?          @db.Text
+  withdrawnOn DateTime         @map("withdrawn_on") @db.Date
+  refundKobo  BigInt           @default(0) @map("refund_kobo")
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("WithdrawalRecordCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("WithdrawalRecordUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("WithdrawalRecordDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([studentId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("withdrawal_records")
+}
+
+model Certificate {
+  id              String          @id @default(uuid()) @db.Uuid
+  studentId       String          @map("student_id") @db.Uuid
+  student         Student         @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  certificateType CertificateType @map("certificate_type")
+  serialNo        String          @unique @map("serial_no") @db.VarChar(30)
+  issuedOn        DateTime        @map("issued_on") @db.Date
+  fileAssetId     String?         @map("file_asset_id") @db.Uuid
+  fileAsset       FileAsset?      @relation(fields: [fileAssetId], references: [id], onDelete: SetNull)
+  revoked         Boolean         @default(false)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("CertificateCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("CertificateUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("CertificateDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([studentId])
+  @@index([certificateType])
+  @@index([fileAssetId])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("certificates")
+}
+
+/// The student-specific document archive — birth certificates, passport
+/// photos, previous school results — distinct from FileAsset (which is the
+/// generic school-wide file manager): this table is what makes a stored
+/// file *this student's document of that kind*, with its own verification
+/// workflow.
+model StudentDocument {
+  id           String           @id @default(uuid()) @db.Uuid
+  studentId    String           @map("student_id") @db.Uuid
+  student      Student          @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  category     DocumentCategory
+  fileAssetId  String           @map("file_asset_id") @db.Uuid
+  fileAsset    FileAsset        @relation(fields: [fileAssetId], references: [id], onDelete: Restrict)
+  verifiedById String?          @map("verified_by_staff_id") @db.Uuid
+  verifiedBy   Staff?           @relation("StudentDocumentVerifiedByStaff", fields: [verifiedById], references: [id], onDelete: SetNull)
+  verifiedOn   DateTime?        @map("verified_on") @db.Date
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("StudentDocumentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("StudentDocumentUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("StudentDocumentDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([studentId])
+  @@index([category])
+  @@index([fileAssetId])
+  @@index([verifiedById])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("student_documents")
+}
+
+/// Never the biometric template itself — templateRef is a pointer/hash into
+/// whatever purpose-built biometric device or vault actually holds the
+/// fingerprint/face data. Raw biometric material has no business sitting in
+/// the same database as fee balances and lesson plans; this table only
+/// answers "is this student enrolled, in what modality, since when".
+model BiometricRecord {
+  id          String        @id @default(uuid()) @db.Uuid
+  studentId   String        @map("student_id") @db.Uuid
+  student     Student       @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  type        BiometricType
+  templateRef String        @map("template_ref") @db.VarChar(255)
+  enrolledOn  DateTime      @map("enrolled_on") @db.Date
+  deviceId    String?       @map("device_id") @db.VarChar(80)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("BiometricRecordCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("BiometricRecordUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("BiometricRecordDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@unique([studentId, type])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("biometric_records")
+}
+
+/// Append-only narrative history, one row per notable thing that happened to
+/// a student — enrolment, promotion, an incident, a certificate issued.
+/// Distinct from AuditLog: AuditLog is a technical "who changed what record"
+/// trail across the whole system; this is the biographical read a
+/// registrar or parent actually wants — "what has happened to this child
+/// here" — and is written deliberately by the handful of workflows that
+/// produce a milestone, not by every field edit.
+model StudentTimelineEvent {
+  id          String           @id @default(uuid()) @db.Uuid
+  studentId   String           @map("student_id") @db.Uuid
+  student     Student          @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  category    TimelineCategory
+  title       String           @db.VarChar(160)
+  description String?          @db.Text
+  occurredOn  DateTime         @map("occurred_on") @db.Date
+
+  createdAt   DateTime @default(now())
+  createdById String?  @map("created_by_id") @db.Uuid
+
+  @@index([studentId])
+  @@index([occurredOn])
+  @@index([category])
+  @@map("student_timeline_events")
+}
+
+// ============================================================================
+// AI ASSISTANT — conversation history for the Intelligent School OS layer.
+// Distinct from AuditLog (technical "what changed") and Notification (things
+// pushed at a role): this is the AI's own back-and-forth with one signed-in
+// user, kept so a conversation has multi-turn memory and so the feedback
+// loop has something to attach a thumbs up/down to. Every turn that actually
+// touches data still gets its own AuditLog row via the audit module — this
+// table is the conversational record, not the compliance one.
+// ============================================================================
+
+enum AiMessageRole {
+  USER
+  ASSISTANT
+}
+
+enum AiFeedback {
+  UP
+  DOWN
+}
+
+model AiConversation {
+  id      String @id @default(uuid()) @db.Uuid
+  userId  String @map("user_id") @db.Uuid
+  user    User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roleKey String @map("role_key") @db.VarChar(40) // snapshot — what the user was authorised as when this started
+
+  messages AiMessage[]
+
+  createdAt     DateTime @default(now())
+  lastMessageAt DateTime @default(now()) @map("last_message_at")
+
+  @@index([userId])
+  @@map("ai_conversations")
+}
+
+/// Append-only, like AuditLog — a turn is never edited after the fact, only
+/// annotated with feedback. `intent` is the tool name the gateway resolved
+/// the turn to (null for denials/errors/plain clarifying questions); `params`
+/// is the typed input Claude extracted for that tool; `resultSummary` is a
+/// compact JSON snapshot of what the intent returned, kept here (not just in
+/// AuditLog) so conversation history can be replayed without re-querying.
+model AiMessage {
+  id             String         @id @default(uuid()) @db.Uuid
+  conversationId String         @map("conversation_id") @db.Uuid
+  conversation   AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           AiMessageRole
+  content        String         @db.Text
+  intent         String?        @db.VarChar(64)
+  params         Json?
+  resultSummary  Json?          @map("result_summary")
+  feedback       AiFeedback?
+
+  createdAt DateTime @default(now())
+
+  @@index([conversationId])
+  @@index([intent])
+  @@map("ai_messages")
+}

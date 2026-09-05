@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fadesrek Academy — School Management System</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Poppins:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="icon" type="image/jpeg" href="public/src/fadesrek logo.jpg">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="auth-screen" id="auth-screen"></div>
+
+<div class="app">
+  <nav class="rail" aria-label="Main">
+    <div class="brand"><div class="crest" id="rail-crest"></div>
+      <b>Fadesrek<span>Academy</span></b></div>
+    <div class="nav" id="nav"></div>
+    <div class="rail-art" aria-hidden="true">
+      <svg viewBox="0 0 180 130" xmlns="http://www.w3.org/2000/svg">
+        <ellipse cx="90" cy="120" rx="62" ry="7" fill="#13083E"/>
+        <path d="M42 118V92c0-11 5-17 14-17s14 6 14 17v26z" fill="#1A6FAF"/>
+        <rect x="49" y="75" width="14" height="9" rx="4" fill="#F0B7A0"/><circle cx="56" cy="66" r="11" fill="#F0B7A0"/>
+        <path d="M45 64c0-7 5-12 11-12s11 5 11 12c0 0-4-4-11-4s-11 4-11 4z" fill="#2B2B3A"/>
+        <rect x="41" y="112" width="9" height="8" rx="3" fill="#13083E"/><rect x="62" y="112" width="9" height="8" rx="3" fill="#13083E"/>
+        <path d="M76 118V88c0-12 6-19 15-19s15 7 15 19v30z" fill="#fff"/>
+        <path d="M76 118V88c0-12 6-19 15-19v49z" fill="#E1E3F7"/>
+        <rect x="84" y="69" width="14" height="9" rx="4" fill="#8B5E3C"/><circle cx="91" cy="59" r="12" fill="#8B5E3C"/>
+        <path d="M79 57c0-8 5-13 12-13s12 5 12 13c0 0-5-5-12-5s-12 5-12 5z" fill="#20202C"/>
+        <path d="M104 86l9-22" stroke="#8B5E3C" stroke-width="7" stroke-linecap="round"/><circle cx="114" cy="60" r="5" fill="#8B5E3C"/>
+        <rect x="75" y="112" width="10" height="8" rx="3" fill="#13083E"/><rect x="97" y="112" width="10" height="8" rx="3" fill="#13083E"/>
+        <path d="M110 118V93c0-10 5-16 13-16s13 6 13 16v25z" fill="#1A6FAF"/>
+        <rect x="117" y="77" width="13" height="8" rx="4" fill="#C68863"/><circle cx="123" cy="68" r="10" fill="#C68863"/>
+        <path d="M113 66c0-6 4-11 10-11s10 5 10 11c0 0-4-4-10-4s-10 4-10 4z" fill="#2B2B3A"/>
+        <rect x="112" y="93" width="24" height="15" rx="2" fill="#fff"/><path d="M124 93v15" stroke="#C9CEE4" stroke-width="1.5"/>
+        <rect x="110" y="112" width="9" height="8" rx="3" fill="#13083E"/><rect x="128" y="112" width="9" height="8" rx="3" fill="#13083E"/>
+      </svg>
+    </div>
+  </nav>
+
+  <main class="panel">
+    <header class="ptop">
+      <span class="term-chip" id="term-chip"></span>
+      <div class="wordmark">
+        <span class="n">Fadesrek <i>Academy</i></span>
+        <span class="s">Soaring to Excellence · Kubwa, Abuja FCT</span>
+      </div>
+      <div class="whoami">
+        <button class="icon-btn" id="ai-assistant-btn" type="button" aria-label="AI Assistant">
+          <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2v3M4.5 5.5l2 2M2 12h3M4.5 18.5l2-2M15.5 5.5l-2 2M18 12h-3M15.5 18.5l-2-2"/><circle cx="10" cy="12" r="4"/></svg>
+        </button>
+        <button class="icon-btn" id="notif-bell" type="button" aria-label="Notifications"></button>
+        <button class="icon-btn" id="theme-toggle" type="button" data-theme-toggle aria-label="Toggle dark mode"></button>
+        <div class="t">
+          <div class="nm" id="who-name"></div>
+          <div class="role-line">
+            <span class="role-tag" id="who-role"></span>
+            <button class="link-btn" id="sign-out" type="button">Sign out</button>
+          </div>
+        </div>
+        <div class="av" id="who-av"></div>
+      </div>
+    </header>
+    <div id="page"></div>
+  </main>
+</div>
+
+<div id="modal-root"></div>
+<div class="toasts" id="toasts"></div>
+
+<script src="script.js"></script>
+</body>
+</html>
