@@ -7,6 +7,7 @@ const { requirePermission } = require('../lib/requirePermission');
 const { forUpdate } = require('../lib/stamps');
 const { badRequest, notFound } = require('../lib/httpErrors');
 const { mountSimpleCrud } = require('../lib/simpleCrud');
+const { toDate } = require('../lib/dates');
 
 const router = express.Router();
 
@@ -52,6 +53,48 @@ router.post('/public/enquiries', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// The public site's other three lead-capture forms — same "no session, one
+// required shape" contract as /public/enquiries above.
+
+router.post('/public/newsletter', async (req, res, next) => {
+  try {
+    const { email, name } = req.body || {};
+    if (!email) throw badRequest('email_required');
+    const row = await prisma.newsletterSubscriber.upsert({
+      where: { email },
+      update: { name: name || undefined },
+      create: { email, name, status: 'ACTIVE' },
+    });
+    res.status(201).json({ id: row.id });
+  } catch (err) { next(err); }
+});
+
+router.post('/public/alumni-registrations', async (req, res, next) => {
+  try {
+    const { fullName, graduationYear, email, phone, currentOccupation } = req.body || {};
+    if (!fullName || !graduationYear || !email || !phone) throw badRequest('missing_required_fields');
+    const row = await prisma.alumniRegistration.create({
+      data: { fullName, graduationYear, email, phone, currentOccupation, status: 'ACTIVE' },
+    });
+    res.status(201).json({ id: row.id });
+  } catch (err) { next(err); }
+});
+
+router.post('/public/visit-requests', async (req, res, next) => {
+  try {
+    const { parentName, parentPhone, parentEmail, childName, childDateOfBirth, programmeSlug, preferredDate, preferredTime, notes } = req.body || {};
+    if (!parentName || !parentPhone || !preferredDate || !preferredTime) throw badRequest('missing_required_fields');
+    const row = await prisma.visitRequest.create({
+      data: {
+        parentName, parentPhone, parentEmail, childName, programmeSlug, preferredTime, notes,
+        childDateOfBirth: toDate(childDateOfBirth), preferredDate: toDate(preferredDate),
+        status: 'ACTIVE',
+      },
+    });
+    res.status(201).json({ id: row.id });
+  } catch (err) { next(err); }
+});
+
 // -------------------------------------------------------------- admin CRUD --
 
 mountSimpleCrud(router, '/pages', { model: 'page', module: 'website', fields: ['slug', 'title', 'content'], searchFields: ['title', 'slug'] });
@@ -91,6 +134,40 @@ router.patch('/enquiries/:id/handle', requireSession, requirePermission('website
     const existing = await prisma.enquiry.findUnique({ where: { id: req.params.id } });
     if (!existing || existing.deletedAt) throw notFound();
     const row = await prisma.enquiry.update({
+      where: { id: req.params.id },
+      data: { handled: true, ...forUpdate(req.session), version: { increment: 1 } },
+    });
+    res.json(row);
+  } catch (err) { next(err); }
+});
+
+router.get('/newsletter-subscribers', requireSession, requirePermission('website.view'), async (req, res, next) => {
+  try {
+    const rows = await prisma.newsletterSubscriber.findMany({ where: { deletedAt: null }, orderBy: { createdAt: 'desc' } });
+    res.json({ data: rows });
+  } catch (err) { next(err); }
+});
+
+router.get('/alumni-registrations', requireSession, requirePermission('website.view'), async (req, res, next) => {
+  try {
+    const rows = await prisma.alumniRegistration.findMany({ where: { deletedAt: null }, orderBy: { createdAt: 'desc' } });
+    res.json({ data: rows });
+  } catch (err) { next(err); }
+});
+
+router.get('/visit-requests', requireSession, requirePermission('website.view'), async (req, res, next) => {
+  try {
+    const where = { deletedAt: null, ...(req.query.handled !== undefined ? { handled: req.query.handled === 'true' } : {}) };
+    const rows = await prisma.visitRequest.findMany({ where, orderBy: { preferredDate: 'asc' } });
+    res.json({ data: rows });
+  } catch (err) { next(err); }
+});
+
+router.patch('/visit-requests/:id/handle', requireSession, requirePermission('website.edit'), async (req, res, next) => {
+  try {
+    const existing = await prisma.visitRequest.findUnique({ where: { id: req.params.id } });
+    if (!existing || existing.deletedAt) throw notFound();
+    const row = await prisma.visitRequest.update({
       where: { id: req.params.id },
       data: { handled: true, ...forUpdate(req.session), version: { increment: 1 } },
     });

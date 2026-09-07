@@ -486,9 +486,9 @@ model User {
   updatedMessageThreads        MessageThread[]        @relation("MessageThreadUpdatedBy")
   deletedMessageThreads        MessageThread[]        @relation("MessageThreadDeletedBy")
   sentMessages                 Message[]
-  createdRemarks                Remark[]               @relation("RemarkCreatedBy")
-  updatedRemarks                Remark[]               @relation("RemarkUpdatedBy")
-  deletedRemarks                Remark[]               @relation("RemarkDeletedBy")
+  createdRemarks               Remark[]               @relation("RemarkCreatedBy")
+  updatedRemarks               Remark[]               @relation("RemarkUpdatedBy")
+  deletedRemarks               Remark[]               @relation("RemarkDeletedBy")
   createdPages                 Page[]                 @relation("PageCreatedBy")
   updatedPages                 Page[]                 @relation("PageUpdatedBy")
   deletedPages                 Page[]                 @relation("PageDeletedBy")
@@ -504,6 +504,15 @@ model User {
   createdEnquiries             Enquiry[]              @relation("EnquiryCreatedBy")
   updatedEnquiries             Enquiry[]              @relation("EnquiryUpdatedBy")
   deletedEnquiries             Enquiry[]              @relation("EnquiryDeletedBy")
+  createdNewsletterSubscribers NewsletterSubscriber[] @relation("NewsletterSubscriberCreatedBy")
+  updatedNewsletterSubscribers NewsletterSubscriber[] @relation("NewsletterSubscriberUpdatedBy")
+  deletedNewsletterSubscribers NewsletterSubscriber[] @relation("NewsletterSubscriberDeletedBy")
+  createdAlumniRegistrations   AlumniRegistration[]   @relation("AlumniRegistrationCreatedBy")
+  updatedAlumniRegistrations   AlumniRegistration[]   @relation("AlumniRegistrationUpdatedBy")
+  deletedAlumniRegistrations   AlumniRegistration[]   @relation("AlumniRegistrationDeletedBy")
+  createdVisitRequests         VisitRequest[]         @relation("VisitRequestCreatedBy")
+  updatedVisitRequests         VisitRequest[]         @relation("VisitRequestUpdatedBy")
+  deletedVisitRequests         VisitRequest[]         @relation("VisitRequestDeletedBy")
   createdFileAssets            FileAsset[]            @relation("FileAssetCreatedBy")
   updatedFileAssets            FileAsset[]            @relation("FileAssetUpdatedBy")
   deletedFileAssets            FileAsset[]            @relation("FileAssetDeletedBy")
@@ -853,8 +862,8 @@ model Guardian {
   phone     String  @db.VarChar(20)
   email     String? @db.VarChar(120)
 
-  user          User?
-  students      StudentGuardian[]
+  user           User?
+  students       StudentGuardian[]
   messageThreads MessageThread[]
 
   createdAt   DateTime     @default(now())
@@ -1992,14 +2001,14 @@ model Message {
 /// computed from the average. One per (student, staff, term): a class
 /// teacher and a principal can both leave one for the same term.
 model Remark {
-  id        String @id @default(uuid()) @db.Uuid
-  studentId String @map("student_id") @db.Uuid
+  id        String  @id @default(uuid()) @db.Uuid
+  studentId String  @map("student_id") @db.Uuid
   student   Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
-  staffId   String @map("staff_id") @db.Uuid
+  staffId   String  @map("staff_id") @db.Uuid
   staff     Staff   @relation(fields: [staffId], references: [id], onDelete: Restrict)
-  termId    String @map("term_id") @db.Uuid
+  termId    String  @map("term_id") @db.Uuid
   term      Term    @relation(fields: [termId], references: [id], onDelete: Restrict)
-  body      String @db.Text
+  body      String  @db.Text
 
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
@@ -2165,6 +2174,91 @@ model Enquiry {
   @@index([updatedById])
   @@index([deletedById])
   @@map("enquiries")
+}
+
+// The school website's three other lead-capture forms (newsletter, alumni
+// register, book-a-visit) — same public-write / staff-read shape as Enquiry
+// above, just narrower fields per form.
+
+model NewsletterSubscriber {
+  id    String  @id @default(uuid()) @db.Uuid
+  email String  @unique @db.VarChar(160)
+  name  String? @db.VarChar(120)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("NewsletterSubscriberCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("NewsletterSubscriberUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("NewsletterSubscriberDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("newsletter_subscribers")
+}
+
+model AlumniRegistration {
+  id                String  @id @default(uuid()) @db.Uuid
+  fullName          String  @map("full_name") @db.VarChar(120)
+  graduationYear    String  @map("graduation_year") @db.VarChar(4)
+  email             String  @db.VarChar(160)
+  phone             String  @db.VarChar(20)
+  currentOccupation String? @map("current_occupation") @db.Text
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("AlumniRegistrationCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("AlumniRegistrationUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("AlumniRegistrationDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("alumni_registrations")
+}
+
+model VisitRequest {
+  id               String    @id @default(uuid()) @db.Uuid
+  parentName       String    @map("parent_name") @db.VarChar(120)
+  parentPhone      String    @map("parent_phone") @db.VarChar(20)
+  parentEmail      String?   @map("parent_email") @db.VarChar(160)
+  childName        String?   @map("child_name") @db.VarChar(120)
+  childDateOfBirth DateTime? @map("child_date_of_birth") @db.Date
+  programmeSlug    String?   @map("programme_slug") @db.VarChar(60)
+  preferredDate    DateTime  @map("preferred_date") @db.Date
+  preferredTime    String    @map("preferred_time") @db.VarChar(80)
+  notes            String?   @db.Text
+  handled          Boolean   @default(false)
+
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime?
+  createdById String?      @map("created_by_id") @db.Uuid
+  createdBy   User?        @relation("VisitRequestCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?      @map("updated_by_id") @db.Uuid
+  updatedBy   User?        @relation("VisitRequestUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+  deletedById String?      @map("deleted_by_id") @db.Uuid
+  deletedBy   User?        @relation("VisitRequestDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+  status      RecordStatus @default(ACTIVE)
+  version     Int          @default(1)
+
+  @@index([handled])
+  @@index([createdById])
+  @@index([updatedById])
+  @@index([deletedById])
+  @@map("visit_requests")
 }
 
 // ============================================================================
